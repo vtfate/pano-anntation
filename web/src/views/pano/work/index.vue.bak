@@ -1,0 +1,352 @@
+<template>
+  <div class="h-full flex flex-col bg-gray-100 p-2" style="height: calc(100vh - 100px)">
+    <div class="mb-2 flex items-center justify-between rounded bg-white p-3 shadow-sm">
+      <div class="flex items-center gap-4">
+        <n-button size="small" @click="$router.back()">返回上级</n-button>
+        <span class="text-lg font-bold">🎯 标注工作台：{{ currentName }}</span>
+      </div>
+      <div>
+        <n-tag type="info" class="mr-2">项目 ID: {{ projectId }}</n-tag>
+      </div>
+    </div>
+
+    <div class="flex flex-1 gap-2 overflow-hidden">
+      <div
+        class="relative flex flex-1 items-center justify-center overflow-hidden rounded bg-black shadow-inner"
+      >
+        <div
+          v-if="!hasClicked"
+          class="pointer-events-none absolute top-5 z-10 rounded-full bg-black/70 px-4 py-2 text-white shadow-lg"
+        >
+          👆 请点击全景图中的目标物体中心
+        </div>
+
+        <img
+          ref="panoImgRef"
+          :src="currentUrl"
+          class="max-h-full max-w-full cursor-crosshair transition-transform duration-300"
+          draggable="false"
+          @click="handlePanoClick"
+        />
+
+        <div
+          v-if="clickPos.visible"
+          class="pointer-events-none absolute h-4 w-4 transform border-2 border-white rounded-full bg-red-500 shadow-md -translate-x-1/2 -translate-y-1/2"
+          :style="{ left: clickPos.x + 'px', top: clickPos.y + 'px' }"
+        ></div>
+      </div>
+
+      <div class="w-[400px] flex flex-col overflow-y-auto rounded bg-white p-4 shadow-sm">
+        <n-spin :show="loadingCrop">
+          <n-space vertical size="large">
+            <div class="flex items-center justify-between border-b pb-2">
+              <h3 class="text-lg font-bold">🔭 局部透视视图</h3>
+              <n-tag :type="perspectiveData ? 'success' : 'default'">
+                {{ perspectiveData ? '视角已锁定' : '等待选点' }}
+              </n-tag>
+            </div>
+
+            <div class="rounded bg-gray-50 p-3">
+              <div class="mb-1 flex justify-between text-sm font-bold text-gray-600">
+                <span>视场角 (FOV)</span>
+                <span>{{ fov }}°</span>
+              </div>
+              <n-slider
+                v-model:value="fov"
+                :min="30"
+                :max="120"
+                :step="5"
+                :disabled="!hasClicked"
+                @update:value="refreshCrop"
+              />
+            </div>
+
+            <div
+              class="relative aspect-square w-full flex select-none items-center justify-center overflow-hidden border-2 border-gray-300 rounded border-dashed bg-gray-100"
+            >
+              <div v-if="!perspectiveData" class="flex flex-col items-center text-sm text-gray-400">
+                <span class="mb-2 text-4xl">📸</span>
+                在左侧点击后生成视图
+              </div>
+
+              <div
+                v-else
+                ref="drawBoardRef"
+                class="relative h-full w-full cursor-crosshair"
+                draggable="false"
+                @mousedown="startDrawing"
+                @mousemove="drawing"
+                @mouseup="endDrawing"
+                @mouseleave="endDrawing"
+              >
+                <img
+                  :src="perspectiveData.image_base64"
+                  class="pointer-events-none h-full w-full select-none"
+                  draggable="false"
+                />
+
+                <div
+                  v-if="isDrawing"
+                  class="pointer-events-none absolute border-2 border-blue-500 bg-blue-500/20"
+                  :style="drawingStyle"
+                ></div>
+
+                <div
+                  v-if="finalBox"
+                  class="absolute border-2 border-green-500 bg-green-500/20"
+                  :style="finalBoxStyle"
+                ></div>
+              </div>
+            </div>
+
+            <div v-if="perspectiveData" class="mt-2">
+              <n-form-item label="选择物体类别 (来自项目配置)">
+                <n-select
+                  v-model:value="selectedLabelId"
+                  :options="labelOptions"
+                  placeholder="请选择标签"
+                  class="w-full"
+                />
+              </n-form-item>
+
+              <n-button
+                type="primary"
+                size="large"
+                block
+                :disabled="!finalBox || !selectedLabelId"
+                :loading="submitLoading"
+                class="mt-2"
+                @click="submitAnnotation"
+              >
+                💾 保存标注结果
+              </n-button>
+
+              <div class="bg-gray-80 mt-4 break-all rounded p-3 text-xs font-mono text-gray-500">
+                <p><b>Debug Info:</b></p>
+                <p>Theta (θ): {{ perspectiveData.center_theta.toFixed(4) }}</p>
+                <p>Phi (φ): {{ perspectiveData.center_phi.toFixed(4) }}</p>
+                <p v-if="finalBox">
+                  Box: [x:{{ Math.round(finalBox.x) }}, y:{{ Math.round(finalBox.y) }}, w:{{
+                    Math.round(finalBox.w)
+                  }}, h:{{ Math.round(finalBox.h) }}]
+                </p>
+              </div>
+            </div>
+          </n-space>
+        </n-spin>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { ref, reactive, computed, onMounted } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { NButton, NSpace, NSlider, NSelect, NTag, NSpin, NFormItem, useMessage } from 'naive-ui'
+import imageApi from '@/api/image'
+import projectApi from '@/api/project'
+
+const route = useRoute()
+const router = useRouter()
+const message = useMessage()
+
+// 路由传参状态
+const projectId = ref(null)
+const currentId = ref(null)
+const currentUrl = ref('')
+const currentName = ref('')
+
+// 业务状态
+const hasClicked = ref(false)
+const loadingCrop = ref(false)
+const submitLoading = ref(false)
+
+// 标签相关 (从项目配置中动态获取)
+const labelOptions = ref([])
+const selectedLabelId = ref(null)
+
+// 核心参数
+const fov = ref(90)
+const perspectiveData = ref(null)
+const realCoords = reactive({ u: 0, v: 0 })
+const clickPos = reactive({ visible: false, x: 0, y: 0 })
+
+// 画板相关
+const drawBoardRef = ref(null)
+const isDrawing = ref(false)
+const startPos = reactive({ x: 0, y: 0 })
+const currPos = reactive({ x: 0, y: 0 })
+const finalBox = ref(null)
+
+// 初始化：获取路由参数并拉取项目标签
+onMounted(() => {
+  const { projectId: pid, imageId, url, name } = route.query
+  if (pid && imageId) {
+    projectId.value = parseInt(pid)
+    currentId.value = parseInt(imageId)
+    currentUrl.value = url
+    currentName.value = name
+
+    // 初始化拉取当前项目的标签列表
+    fetchProjectLabels()
+  } else {
+    message.warning('参数缺失，请从项目详情页进入')
+    router.back()
+  }
+})
+
+// 动态获取标签下拉列表
+const fetchProjectLabels = async () => {
+  try {
+    const res = await projectApi.getLabels(projectId.value)
+    const labels = res.data || res || []
+    // 转换为 Naive UI n-select 需要的格式: { label: '显示文本', value: '绑定的值' }
+    labelOptions.value = labels.map((item) => ({
+      label: item.name,
+      value: item.id, // 绑定真实数据库 ID
+    }))
+
+    // 如果有标签，默认选中第一个
+    if (labelOptions.value.length > 0) {
+      selectedLabelId.value = labelOptions.value[0].value
+    } else {
+      message.warning('当前项目还未配置标签，请先返回上级添加标签')
+    }
+  } catch (error) {
+    console.error('获取标签失败', error)
+  }
+}
+
+// 1. 全景图点击处理 (核心：计算物理像素映射)
+const handlePanoClick = async (e) => {
+  const img = e.target
+  const rect = img.getBoundingClientRect()
+
+  // 记录屏幕相对坐标
+  const x = e.clientX - rect.left
+  const y = e.clientY - rect.top
+  clickPos.x = x
+  clickPos.y = y
+  clickPos.visible = true
+
+  // 计算原始图像的真实像素坐标 (Natural Size)
+  const scaleX = img.naturalWidth / rect.width
+  const scaleY = img.naturalHeight / rect.height
+  realCoords.u = x * scaleX
+  realCoords.v = y * scaleY
+
+  hasClicked.value = true
+  await refreshCrop()
+}
+
+// 2. 请求透视切片算法
+const refreshCrop = async () => {
+  if (!hasClicked.value) return
+  loadingCrop.value = true
+  finalBox.value = null // 清除之前画的框
+
+  try {
+    const res = await imageApi.getPerspective({
+      image_id: currentId.value,
+      u: realCoords.u,
+      v: realCoords.v,
+      fov: fov.value,
+    })
+    perspectiveData.value = res.data || res
+  } catch (err) {
+    message.error('切图失败，请检查后端算法运行状态')
+  } finally {
+    loadingCrop.value = false
+  }
+}
+
+// 3. 画板逻辑 (原生计算)
+const getOffset = (e) => {
+  const rect = drawBoardRef.value.getBoundingClientRect()
+  return {
+    x: e.clientX - rect.left,
+    y: e.clientY - rect.top,
+  }
+}
+
+const startDrawing = (e) => {
+  isDrawing.value = true
+  finalBox.value = null
+  const { x, y } = getOffset(e)
+  startPos.x = x
+  startPos.y = y
+  currPos.x = x
+  currPos.y = y
+}
+
+const drawing = (e) => {
+  if (!isDrawing.value) return
+  const { x, y } = getOffset(e)
+  // 限制鼠标不能画出边界
+  const rect = drawBoardRef.value.getBoundingClientRect()
+  currPos.x = Math.max(0, Math.min(x, rect.width))
+  currPos.y = Math.max(0, Math.min(y, rect.height))
+}
+
+const endDrawing = () => {
+  if (!isDrawing.value) return
+  isDrawing.value = false
+
+  const w = Math.abs(currPos.x - startPos.x)
+  const h = Math.abs(currPos.y - startPos.y)
+  const x = Math.min(currPos.x, startPos.x)
+  const y = Math.min(currPos.y, startPos.y)
+
+  // 防止点击误触，宽高大于 5 像素才算有效框
+  if (w > 5 && h > 5) {
+    finalBox.value = { x, y, w, h }
+  }
+}
+
+// 4. 动态计算框的样式
+const drawingStyle = computed(() => {
+  const w = Math.abs(currPos.x - startPos.x)
+  const h = Math.abs(currPos.y - startPos.y)
+  const left = Math.min(currPos.x, startPos.x)
+  const top = Math.min(currPos.y, startPos.y)
+  return { left: `${left}px`, top: `${top}px`, width: `${w}px`, height: `${h}px` }
+})
+
+const finalBoxStyle = computed(() => {
+  if (!finalBox.value) return {}
+  return {
+    left: `${finalBox.value.x}px`,
+    top: `${finalBox.value.y}px`,
+    width: `${finalBox.value.w}px`,
+    height: `${finalBox.value.h}px`,
+  }
+})
+
+// 5. 提交终态数据到数据库
+const submitAnnotation = async () => {
+  if (!finalBox.value || !selectedLabelId.value) return
+
+  submitLoading.value = true
+  // 按照后端的 AnnotationCreate Schema 组装数据
+  const payload = {
+    label_id: selectedLabelId.value,
+    center_theta: perspectiveData.value.center_theta,
+    center_phi: perspectiveData.value.center_phi,
+    fov: perspectiveData.value.fov,
+    box_x: finalBox.value.x,
+    box_y: finalBox.value.y,
+    box_w: finalBox.value.w,
+    box_h: finalBox.value.h,
+  }
+
+  try {
+    await imageApi.saveAnnotation(currentId.value, payload)
+    message.success('🎉 标注保存成功！你可以继续点击其他位置')
+    finalBox.value = null // 清空框，方便连续标注
+  } catch (err) {
+    message.error('保存失败')
+  } finally {
+    submitLoading.value = false
+  }
+}
+</script>
